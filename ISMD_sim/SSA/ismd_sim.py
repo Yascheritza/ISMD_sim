@@ -229,86 +229,93 @@ class ISMDState:
         self.n = cp.asarray(n_init, dtype=cp.float64)
         self.u = cp.asarray(u_init, dtype=cp.float64)
 
-    def step(self, dt: float) -> None:
-        """
-        Decomposition Propagation.
-        """
-        N = self.total_cells
+    @staticmethod
+    def _linear_flow(value, alpha, beta, duration: float, tiny: float):
+        small_beta = cp.abs(beta) < tiny
+        safe_beta = cp.where(small_beta, 1.0, beta)
+        decay = cp.exp(-beta * duration)
+        regular = value * decay - cp.expm1(-beta * duration) * alpha / safe_beta
+        return cp.where(small_beta, value + alpha * duration, regular)
+
+    def _advance_density(self, index: int, duration: float, tiny: float) -> None:
         h = self.h_volume
+        alpha = h * (
+            cp.dot(self.a_mat[index], self.n) - self.a_mat[index, index] * self.n[index]
+            - cp.dot(self.b_mat[index], self.u[index])
+        )
+        beta = self.m - h * self.a_mat[index, index]
+        self.n[index] = self._linear_flow(self.n[index], alpha, beta, duration, tiny)
+
+    def _pair_coefficients(self, i: int, j: int, tiny: float):
+        h = self.h_volume
+        n_safe = cp.where(self.n > 0.0, self.n, tiny)
+        ni = n_safe[i]
+        nj = n_safe[j]
+
+        alpha = self.a_mat[i, j] * (self.n[i] + self.n[j])
+        alpha += h * (
+            cp.dot(self.a_mat[i], self.u[j]) - self.a_mat[i, i] * self.u[j, i]
+        )
+        alpha += h * (
+            cp.dot(self.a_mat[j], self.u[i]) - self.a_mat[j, j] * self.u[i, j]
+        )
+
+        beta_i = self.m - h * self.a_mat[i, i]
+        ksa_sum = (
+            (self.b_mat[i] + self.b_mat[j])
+            * self.u[i]
+            * self.u[j]
+            / n_safe
+        )
+        ksa_sum[i] = 0.0
+        ksa_sum[j] = 0.0
+        beta = 2.0 * (beta_i + self.b_mat[i, j]) + h * cp.sum(ksa_sum) / (ni * nj)
+
+        gamma = h * (self.b_mat[i, i] + self.b_mat[i, j]) / (ni * nj)
+        gamma *= self.u[i, i] / ni + self.u[j, j] / nj
+        zeta = 2.0 * h * self.b_mat[i, i] / (ni ** 3)
+        return alpha, beta, gamma, zeta
+
+    def _advance_pair(self, i: int, j: int, duration: float, tiny: float) -> None:
+        alpha, beta, gamma, zeta = self._pair_coefficients(i, j, tiny)
+        value = self.u[i, j]
+
+        # Симметричное разложение (19): нелинейная половина, линейный шаг, ещё половина.
+        if i == j:
+            value = value / cp.sqrt(1.0 + zeta * value * value * duration)
+        else:
+            value = value / (1.0 + gamma * value * duration / 2.0)
+
+        value = self._linear_flow(value, alpha, beta, duration, tiny)
+
+        if i == j:
+            value = value / cp.sqrt(1.0 + zeta * value * value * duration)
+        else:
+            value = value / (1.0 + gamma * value * duration / 2.0)
+
+        self.u[i, j] = value
+        self.u[j, i] = value
+
+    def step(self, dt: float) -> None:
+        """Выполняет симметричный DP-шаг второго порядка из уравнения (17)."""
+        if dt <= 0.0:
+            raise ValueError("dt must be positive")
+
+        half_dt = dt / 2.0
         tiny = 1e-15
 
-        a_mat_no_diag = self.a_mat.copy()
-        cp.fill_diagonal(a_mat_no_diag, 0.0)
+        for i in range(self.total_cells):
+            for j in range(i, self.total_cells):
+                self._advance_pair(i, j, half_dt, tiny)
 
-        b_diag = cp.diag(self.b_mat)
-        a_diag = cp.diag(self.a_mat)
+        for i in range(self.total_cells - 1, -1, -1):
+            self._advance_density(i, half_dt, tiny)
+        for i in range(self.total_cells):
+            self._advance_density(i, half_dt, tiny)
 
-        sum_a_n = a_mat_no_diag @ self.n
-        sum_b_u = cp.sum(self.b_mat * self.u, axis=1)
-
-        sum_b_n = self.b_mat @ self.n
-
-        alpha_i = h * sum_a_n - h * sum_b_u
-        beta_i = self.m - h * a_diag + h * sum_b_n
-
-        # equation (15) from article
-        n_safe = self.n + tiny
-        n_i_plus_n_j = self.n[:, cp.newaxis] + self.n[cp.newaxis, :]
-        n_i_times_n_j = n_safe[:, cp.newaxis] * n_safe[cp.newaxis, :]
-
-        term1_alpha = self.a_mat * n_i_plus_n_j
-        term2_alpha = h * (a_mat_no_diag @ self.u.T)
-        term3_alpha = h * (self.u @ a_mat_no_diag.T)
-        alpha_ij = term1_alpha + term2_alpha + term3_alpha
-
-        # KSA
-        V = self.u / n_safe[cp.newaxis, :]
-        W = self.b_mat * self.u
-
-        S = (W @ V.T) + (V @ W.T)
-
-        u_diag = cp.diag(self.u)
-        corr_i = (b_diag[:, cp.newaxis] + self.b_mat) * (u_diag[:, cp.newaxis] * self.u) / n_safe[:, cp.newaxis]
-        corr_j = (self.b_mat + b_diag[cp.newaxis, :]) * (self.u * u_diag[cp.newaxis, :]) / n_safe[cp.newaxis, :]
-
-        S_corrected = S - corr_i - corr_j
-        beta_ij = 2.0 * (beta_i[:, cp.newaxis] + self.b_mat) + h * (S_corrected / n_i_times_n_j)
-
-        #gamma_ij, zeta_ii
-        b_ii_plus_b_jj = b_diag[:, cp.newaxis] + b_diag[cp.newaxis, :]
-        u_over_n = u_diag / n_safe
-        u_over_n_sum = u_over_n[:, cp.newaxis] + u_over_n[cp.newaxis, :]
-
-        gamma_ij = h * (b_ii_plus_b_jj / n_i_times_n_j) * u_over_n_sum
-        zeta_ii = (2.0 * h * b_diag) / (n_safe ** 3)
-
-        # DP, equations 18-20 from article
-        exp_beta_half = cp.exp(-beta_ij * (dt / 2.0))
-        safe_beta_ij = cp.where(cp.abs(beta_ij) < tiny, tiny, beta_ij)
-
-        exp_beta_full = cp.exp(-beta_i * dt)
-        safe_beta_i = cp.where(cp.abs(beta_i) < tiny, tiny, beta_i)
-
-        # U (dt/2)
-        self.u = self.u / (1.0 + gamma_ij * self.u * (dt / 4.0))
-        cp.fill_diagonal(self.u, cp.diag(self.u) / cp.sqrt(1.0 + zeta_ii * (cp.diag(self.u) ** 2) * (dt / 2.0)))
-
-        self.u = self.u * exp_beta_half + (1.0 - exp_beta_half) * (alpha_ij / safe_beta_ij)
-
-        self.u = self.u / (1.0 + gamma_ij * self.u * (dt / 4.0))
-        cp.fill_diagonal(self.u, cp.diag(self.u) / cp.sqrt(1.0 + zeta_ii * (cp.diag(self.u) ** 2) * (dt / 2.0)))
-
-        # N (dt)
-        self.n = self.n * exp_beta_full + (1.0 - exp_beta_full) * (alpha_i / safe_beta_i)
-
-        # U (dt/2)
-        self.u = self.u / (1.0 + gamma_ij * self.u * (dt / 4.0))
-        cp.fill_diagonal(self.u, cp.diag(self.u) / cp.sqrt(1.0 + zeta_ii * (cp.diag(self.u) ** 2) * (dt / 2.0)))
-
-        self.u = self.u * exp_beta_half + (1.0 - exp_beta_half) * (alpha_ij / safe_beta_ij)
-
-        self.u = self.u / (1.0 + gamma_ij * self.u * (dt / 4.0))
-        cp.fill_diagonal(self.u, cp.diag(self.u) / cp.sqrt(1.0 + zeta_ii * (cp.diag(self.u) ** 2) * (dt / 2.0)))
+        for i in range(self.total_cells - 1, -1, -1):
+            for j in range(self.total_cells - 1, i - 1, -1):
+                self._advance_pair(i, j, half_dt, tiny)
 
         self.time += dt
 
